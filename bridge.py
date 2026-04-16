@@ -1,16 +1,17 @@
 from web3 import Web3
-from web3.providers.rpc import HTTPProvider
-from web3.middleware import ExtraDataToPOAMiddleware  # Necessary for POA chains
-from datetime import datetime
+from web3.middleware import ExtraDataToPOAMiddleware
 import json
-import pandas as pd
+import os
+
+
+STATE_FILE = "bridge_state.json"
 
 
 def connect_to(chain):
-    if chain == 'source':  # The source contract chain is avax
-        api_url = "https://api.avax-test.network/ext/bc/C/rpc"  # AVAX C-chain testnet
-    elif chain == 'destination':  # The destination contract chain is bsc
-        api_url = "https://data-seed-prebsc-1-s1.binance.org:8545/"  # BSC testnet
+    if chain == "source":  # Avalanche Fuji
+        api_url = "https://api.avax-test.network/ext/bc/C/rpc"
+    elif chain == "destination":  # BSC testnet
+        api_url = "https://data-seed-prebsc-1-s1.binance.org:8545/"
     else:
         raise ValueError(f"Invalid chain: {chain}")
 
@@ -21,11 +22,11 @@ def connect_to(chain):
 
 def get_contract_info(chain, contract_info):
     """
-        Load the contract_info file into a dictionary
-        This function is used by the autograder and will likely be useful to you
+    Load the contract_info file into a dictionary.
+    This function is used by the autograder and will likely be useful to you.
     """
     try:
-        with open(contract_info, 'r') as f:
+        with open(contract_info, "r") as f:
             contracts = json.load(f)
     except Exception as e:
         print(f"Failed to read contract info\nPlease contact your instructor\n{e}")
@@ -33,16 +34,50 @@ def get_contract_info(chain, contract_info):
     return contracts[chain]
 
 
+def load_state():
+    """
+    Load persistent scan state from disk.
+    """
+    if not os.path.exists(STATE_FILE):
+        return {
+            "last_scanned_source": None,
+            "last_scanned_destination": None,
+        }
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "last_scanned_source": None,
+            "last_scanned_destination": None,
+        }
+
+
+def save_state(state):
+    """
+    Save persistent scan state to disk.
+    """
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
 def scan_blocks(chain, contract_info="contract_info.json"):
     """
-        chain - (string) should be either "source" or "destination"
-        Scan the last 5 blocks of the source and destination chains
-        Look for 'Deposit' events on the source chain and 'Unwrap' events on the destination chain
-        When Deposit events are found on the source chain, call the 'wrap' function the destination chain
-        When Unwrap events are found on the destination chain, call the 'withdraw' function on the source chain
+    chain - (string) should be either "source" or "destination"
+
+    Scan source or destination chain for new events since the last scan.
+    Look for 'Deposit' events on the source chain and 'Unwrap' events on the
+    destination chain.
+
+    When Deposit events are found on the source chain, call the 'wrap' function
+    on the destination chain.
+
+    When Unwrap events are found on the destination chain, call the 'withdraw'
+    function on the source chain.
     """
 
-    if chain not in ['source', 'destination']:
+    if chain not in ["source", "destination"]:
         print(f"Invalid chain: {chain}")
         return 0
 
@@ -67,23 +102,25 @@ def scan_blocks(chain, contract_info="contract_info.json"):
 
     source_contract = source_w3.eth.contract(
         address=Web3.to_checksum_address(source_info["address"]),
-        abi=source_info["abi"]
+        abi=source_info["abi"],
     )
 
     destination_contract = destination_w3.eth.contract(
         address=Web3.to_checksum_address(destination_info["address"]),
-        abi=destination_info["abi"]
+        abi=destination_info["abi"],
     )
 
+    state = load_state()
+
     def send_tx(w3, fn):
-        nonce = w3.eth.get_transaction_count(acct.address)
+        nonce = w3.eth.get_transaction_count(acct.address, "pending")
 
         tx = fn.build_transaction({
             "from": acct.address,
             "nonce": nonce,
             "gas": 500000,
             "gasPrice": w3.eth.gas_price,
-            "chainId": w3.eth.chain_id
+            "chainId": w3.eth.chain_id,
         })
 
         signed = acct.sign_transaction(tx)
@@ -92,16 +129,35 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         return receipt
 
     if chain == "source":
-        end_block = source_w3.eth.block_number
-        start_block = max(0, end_block - 5)
+        current_block = source_w3.eth.block_number
+        last_scanned = state.get("last_scanned_source")
+
+        # On first run, scan a reasonable recent window so we don't miss the
+        # grader's deposits. After that, only scan newly added blocks.
+        if last_scanned is None:
+            start_block = max(0, current_block - 20)
+        else:
+            start_block = last_scanned + 1
+
+        end_block = current_block
+
+        if start_block > end_block:
+            print(f"No new source blocks to scan ({start_block} > {end_block})")
+            return 1
 
         print(f"Scanning source blocks {start_block} to {end_block}")
 
-        event_filter = source_contract.events.Deposit.create_filter(
-            from_block=start_block,
-            to_block=end_block
-        )
-        events = event_filter.get_all_entries()
+        try:
+            events = source_contract.events.Deposit().get_logs(
+                from_block=start_block,
+                to_block=end_block
+            )
+        except TypeError:
+            # Compatibility fallback for some web3 versions
+            events = source_contract.events.Deposit.get_logs(
+                fromBlock=start_block,
+                toBlock=end_block
+            )
 
         for evt in events:
             token = evt["args"]["token"]
@@ -117,17 +173,38 @@ def scan_blocks(chain, contract_info="contract_info.json"):
 
             print(f"Called wrap() on destination: {receipt.transactionHash.hex()}")
 
+        state["last_scanned_source"] = end_block
+        save_state(state)
+
     elif chain == "destination":
-        end_block = destination_w3.eth.block_number
-        start_block = max(0, end_block - 5)
+        current_block = destination_w3.eth.block_number
+        last_scanned = state.get("last_scanned_destination")
+
+        # Same logic here: on first run, scan a recent window; later, scan only new blocks.
+        if last_scanned is None:
+            start_block = max(0, current_block - 20)
+        else:
+            start_block = last_scanned + 1
+
+        end_block = current_block
+
+        if start_block > end_block:
+            print(f"No new destination blocks to scan ({start_block} > {end_block})")
+            return 1
 
         print(f"Scanning destination blocks {start_block} to {end_block}")
 
-        event_filter = destination_contract.events.Unwrap.create_filter(
-            from_block=start_block,
-            to_block=end_block
-        )
-        events = event_filter.get_all_entries()
+        try:
+            events = destination_contract.events.Unwrap().get_logs(
+                from_block=start_block,
+                to_block=end_block
+            )
+        except TypeError:
+            # Compatibility fallback for some web3 versions
+            events = destination_contract.events.Unwrap.get_logs(
+                fromBlock=start_block,
+                toBlock=end_block
+            )
 
         for evt in events:
             underlying_token = evt["args"]["underlying_token"]
@@ -142,5 +219,8 @@ def scan_blocks(chain, contract_info="contract_info.json"):
             )
 
             print(f"Called withdraw() on source: {receipt.transactionHash.hex()}")
+
+        state["last_scanned_destination"] = end_block
+        save_state(state)
 
     return 1
