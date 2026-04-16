@@ -5,13 +5,15 @@ import os
 
 
 STATE_FILE = "bridge_state.json"
-BLOCK_CHUNK_SIZE = 3
+BLOCK_CHUNK_SIZE = 1
+INITIAL_LOOKBACK = 25
+MAX_CATCHUP_BLOCKS = 50
 
 
 def connect_to(chain):
-    if chain == "source":  # Avalanche Fuji
+    if chain == "source":
         api_url = "https://api.avax-test.network/ext/bc/C/rpc"
-    elif chain == "destination":  # BSC testnet
+    elif chain == "destination":
         api_url = "https://data-seed-prebsc-1-s1.binance.org:8545/"
     else:
         raise ValueError(f"Invalid chain: {chain}")
@@ -22,10 +24,6 @@ def connect_to(chain):
 
 
 def get_contract_info(chain, contract_info):
-    """
-    Load the contract_info file into a dictionary.
-    This function is used by the autograder and will likely be useful to you.
-    """
     try:
         with open(contract_info, "r") as f:
             contracts = json.load(f)
@@ -58,10 +56,6 @@ def save_state(state):
 
 
 def get_logs_chunked(event_obj, start_block, end_block, chunk_size=BLOCK_CHUNK_SIZE):
-    """
-    Fetch logs in small block ranges to avoid RPC 'limit exceeded' errors.
-    Works across web3 versions.
-    """
     all_events = []
     current = start_block
 
@@ -85,21 +79,34 @@ def get_logs_chunked(event_obj, start_block, end_block, chunk_size=BLOCK_CHUNK_S
     return all_events
 
 
+def choose_scan_range(last_scanned, current_block):
+    """
+    Pick a sane scan window.
+
+    - First run: only look back a small recent window.
+    - Normal run: continue from last_scanned + 1.
+    - If saved state is stale / too old, snap to a recent catchup window.
+    """
+    if last_scanned is None:
+        start_block = max(0, current_block - INITIAL_LOOKBACK)
+        end_block = current_block
+        return start_block, end_block
+
+    if last_scanned >= current_block:
+        return current_block + 1, current_block
+
+    proposed_start = last_scanned + 1
+
+    # If the gap is too large, do not scan thousands of old blocks.
+    if current_block - proposed_start > MAX_CATCHUP_BLOCKS:
+        start_block = max(0, current_block - INITIAL_LOOKBACK)
+        end_block = current_block
+        return start_block, end_block
+
+    return proposed_start, current_block
+
+
 def scan_blocks(chain, contract_info="contract_info.json"):
-    """
-    chain - (string) should be either "source" or "destination"
-
-    Scan source or destination chain for new events since the last scan.
-    Look for 'Deposit' events on the source chain and 'Unwrap' events on the
-    destination chain.
-
-    When Deposit events are found on the source chain, call the 'wrap' function
-    on the destination chain.
-
-    When Unwrap events are found on the destination chain, call the 'withdraw'
-    function on the source chain.
-    """
-
     if chain not in ["source", "destination"]:
         print(f"Invalid chain: {chain}")
         return 0
@@ -155,12 +162,7 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         current_block = source_w3.eth.block_number
         last_scanned = state.get("last_scanned_source")
 
-        if last_scanned is None:
-            start_block = max(0, current_block - 20)
-        else:
-            start_block = last_scanned + 1
-
-        end_block = current_block
+        start_block, end_block = choose_scan_range(last_scanned, current_block)
 
         if start_block > end_block:
             print(f"No new source blocks to scan ({start_block} > {end_block})")
@@ -195,12 +197,7 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         current_block = destination_w3.eth.block_number
         last_scanned = state.get("last_scanned_destination")
 
-        if last_scanned is None:
-            start_block = max(0, current_block - 20)
-        else:
-            start_block = last_scanned + 1
-
-        end_block = current_block
+        start_block, end_block = choose_scan_range(last_scanned, current_block)
 
         if start_block > end_block:
             print(f"No new destination blocks to scan ({start_block} > {end_block})")
