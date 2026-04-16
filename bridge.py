@@ -5,6 +5,7 @@ import os
 
 
 STATE_FILE = "bridge_state.json"
+BLOCK_CHUNK_SIZE = 3
 
 
 def connect_to(chain):
@@ -35,9 +36,6 @@ def get_contract_info(chain, contract_info):
 
 
 def load_state():
-    """
-    Load persistent scan state from disk.
-    """
     if not os.path.exists(STATE_FILE):
         return {
             "last_scanned_source": None,
@@ -55,11 +53,36 @@ def load_state():
 
 
 def save_state(state):
-    """
-    Save persistent scan state to disk.
-    """
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
+
+
+def get_logs_chunked(event_obj, start_block, end_block, chunk_size=BLOCK_CHUNK_SIZE):
+    """
+    Fetch logs in small block ranges to avoid RPC 'limit exceeded' errors.
+    Works across web3 versions.
+    """
+    all_events = []
+    current = start_block
+
+    while current <= end_block:
+        chunk_end = min(current + chunk_size - 1, end_block)
+
+        try:
+            events = event_obj.get_logs(
+                from_block=current,
+                to_block=chunk_end
+            )
+        except TypeError:
+            events = event_obj.get_logs(
+                fromBlock=current,
+                toBlock=chunk_end
+            )
+
+        all_events.extend(events)
+        current = chunk_end + 1
+
+    return all_events
 
 
 def scan_blocks(chain, contract_info="contract_info.json"):
@@ -132,8 +155,6 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         current_block = source_w3.eth.block_number
         last_scanned = state.get("last_scanned_source")
 
-        # On first run, scan a reasonable recent window so we don't miss the
-        # grader's deposits. After that, only scan newly added blocks.
         if last_scanned is None:
             start_block = max(0, current_block - 20)
         else:
@@ -147,17 +168,11 @@ def scan_blocks(chain, contract_info="contract_info.json"):
 
         print(f"Scanning source blocks {start_block} to {end_block}")
 
-        try:
-            events = source_contract.events.Deposit().get_logs(
-                from_block=start_block,
-                to_block=end_block
-            )
-        except TypeError:
-            # Compatibility fallback for some web3 versions
-            events = source_contract.events.Deposit.get_logs(
-                fromBlock=start_block,
-                toBlock=end_block
-            )
+        events = get_logs_chunked(
+            source_contract.events.Deposit(),
+            start_block,
+            end_block
+        )
 
         for evt in events:
             token = evt["args"]["token"]
@@ -180,7 +195,6 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         current_block = destination_w3.eth.block_number
         last_scanned = state.get("last_scanned_destination")
 
-        # Same logic here: on first run, scan a recent window; later, scan only new blocks.
         if last_scanned is None:
             start_block = max(0, current_block - 20)
         else:
@@ -194,17 +208,11 @@ def scan_blocks(chain, contract_info="contract_info.json"):
 
         print(f"Scanning destination blocks {start_block} to {end_block}")
 
-        try:
-            events = destination_contract.events.Unwrap().get_logs(
-                from_block=start_block,
-                to_block=end_block
-            )
-        except TypeError:
-            # Compatibility fallback for some web3 versions
-            events = destination_contract.events.Unwrap.get_logs(
-                fromBlock=start_block,
-                toBlock=end_block
-            )
+        events = get_logs_chunked(
+            destination_contract.events.Unwrap(),
+            start_block,
+            end_block
+        )
 
         for evt in events:
             underlying_token = evt["args"]["underlying_token"]
